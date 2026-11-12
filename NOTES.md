@@ -106,7 +106,7 @@ type Mutation {
 - `eventId` is for tracing duplicates in logs; `version` lets consumers tell shapes apart if the
   event changes.
 
-### Duplicate delivery _(planned, step 4)_
+### Duplicate delivery
 - Kafka is at-least-once. A crash between processing and committing the offset redelivers the event.
 - The consumer (group `orders-fulfillment`) settles only orders still `PLACED`; a redelivered event
   finds the order already settled and does nothing.
@@ -115,6 +115,25 @@ type Mutation {
 - Bad events (malformed, unknown version, unknown order such as one lost in a restart) are logged
   with `eventId`/`orderId` and skipped. The handler never throws, so one bad message can't block
   the partition.
+- Every message ends in one of five outcomes: `confirmed`, `rejected` (logged as info) or
+  `duplicate`, `unknown-order`, `malformed` (logged as warnings). An unexpected exception is
+  logged as an error and skipped, not rethrown.
+- Skipping trades a stuck partition for a possibly lost event; a dead-letter topic would keep
+  those events for replay (follow-up 3).
+- Verified by hand: re-producing a confirmed order's exact message logged `duplicate`, and
+  `orderCount` stayed at 1. Non-JSON, `version: 99`, a missing `quantity` and an unknown order id
+  were each skipped, and the next real order still settled.
+
+Replaying a duplicate by hand (Kafka running):
+```bash
+# read the message at offset N back out, with its key
+docker exec takehome-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic orders.order-placed --partition 0 --offset N --max-messages 1 \
+  --property print.key=true --property key.separator='|' > dup.txt
+# produce it again, byte for byte
+docker exec -i takehome-kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+  --topic orders.order-placed --property parse.key=true --property key.separator='|' < dup.txt
+```
 
 ### Dual write
 - Save the order, then publish. Never the reverse, or a fast consumer could see an event for an

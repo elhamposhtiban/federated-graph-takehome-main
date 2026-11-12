@@ -1,7 +1,7 @@
 import { Kafka, Partitioners, logLevel } from "kafkajs";
 
 import type { Order } from "./domain.js";
-import { ORDER_PLACED_TOPIC, toOrderPlacedEvent, type OrderPlacedEvent } from "./events.js";
+import { ORDER_PLACED_TOPIC, toOrderPlacedEvent } from "./events.js";
 import { handleOrderPlaced } from "./fulfillment.js";
 
 const kafka = new Kafka({
@@ -42,12 +42,17 @@ export async function startFulfillmentConsumer(groupId = "orders-fulfillment") {
   // fromBeginning only applies before the group has committed an offset.
   await consumer.subscribe({ topic: ORDER_PLACED_TOPIC, fromBeginning: true });
   await consumer.run({
-    eachMessage: async ({ message }) => {
-      const event = JSON.parse(message.value?.toString() ?? "") as OrderPlacedEvent;
-      const outcome = handleOrderPlaced(event);
-      console.log(
-        `[fulfillment] ${outcome} order=${event.data.orderId} event=${event.eventId} offset=${message.offset}`,
-      );
+    eachMessage: async ({ partition, message }) => {
+      const where = `partition=${partition} offset=${message.offset} key=${message.key?.toString()}`;
+      try {
+        const { outcome, orderId, eventId } = handleOrderPlaced(message.value?.toString());
+        const line = `[fulfillment] ${outcome} order=${orderId ?? "-"} event=${eventId ?? "-"} ${where}`;
+        if (outcome === "confirmed" || outcome === "rejected") console.log(line);
+        else console.warn(line);
+      } catch (err) {
+        // A bug must not wedge the partition; log it and move on (DLQ is a follow-up).
+        console.error(`[fulfillment] error ${where}`, err);
+      }
     },
   });
   return consumer;
