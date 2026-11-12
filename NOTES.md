@@ -84,6 +84,19 @@ type Mutation {
 - Settlement rule (README item 2): quantity > 10 → `REJECTED`, otherwise `CONFIRMED`. It stands in
   for a real stock check.
 
+### Taking over `Product.orderCount`
+- `orders` declares `orderCount: Int! @override(from: "products")` on its `Product` stub. The gateway
+  stops routing the field to products; their placeholder field and `() => 0` resolver stay as
+  they are, untouched.
+- It's the number of `CONFIRMED` orders, computed from order state on each request rather than
+  stored. `PLACED` and `REJECTED` don't count, and a duplicate event can't inflate it.
+- Verified through the gateway: product 5 with quantities 1, 4 and 20 → `orderCount: 2`, while the
+  products subgraph queried directly still returns its placeholder 0. The query plan for
+  `products { name orderCount }` fetches the list from products, then makes one batched `_entities`
+  call to orders for all five products, not one call per product.
+- Nothing is stored, so a product with no orders returns 0, the same as the placeholder, and the
+  storefront sees no change at cut-over.
+
 ### Rejected orders in lists, long lists
 - Not built (item 7, optional). Design: cursor pagination (`first`/`after`), rejected orders
   excluded by default with a `status` filter to include them.
