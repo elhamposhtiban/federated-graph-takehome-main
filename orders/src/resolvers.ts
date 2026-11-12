@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { GraphQLError } from "graphql";
 
-import type { Order } from "./domain.js";
+import type { Money, Order } from "./domain.js";
 import type { ProductPrice } from "./products-client.js";
 import { confirmedOrdersFor, deleteOrder, getOrder, saveOrder } from "./store.js";
 
@@ -66,6 +66,11 @@ export function createResolvers({ fetchProductPrice, publishOrderPlaced }: Resol
     Product: {
       // Derived from order state, so duplicate events can never inflate it.
       orderCount: (product: { id: string }) => confirmedOrdersFor(product.id).length,
+      // price arrives from products via @requires on every request; it is never stored here.
+      revenue: (product: { id: string; price: Money }) => {
+        const quantity = confirmedOrdersFor(product.id).reduce((sum, o) => sum + o.quantity, 0);
+        return { amount: quantity * product.price.amount, currency: product.price.currency };
+      },
     },
   };
 }

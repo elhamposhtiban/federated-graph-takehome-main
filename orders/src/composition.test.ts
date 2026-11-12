@@ -28,3 +28,14 @@ test("the supergraph routes Product.orderCount to orders", () => {
     /orderCount: Int! @join__field\(graph: ORDERS, override: "products"\)/,
   );
 });
+
+test("revenue requires products' price instead of storing it", () => {
+  assert.match(
+    result.supergraphSdl!,
+    /revenue: Money! @join__field\(graph: ORDERS, requires: "price \{ amount currency \}"\)/,
+  );
+  assert.match(
+    result.supergraphSdl!,
+    /price: Money! @join__field\(graph: ORDERS, external: true\) @join__field\(graph: PRODUCTS\)/,
+  );
+});

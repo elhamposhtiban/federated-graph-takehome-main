@@ -1,6 +1,6 @@
 # NOTES
 
-> Draft, updated as each build step lands. Items marked _(planned)_ are designed but not built yet.
+> Draft, updated as each build step lands.
 
 ## Schema (`orders`)
 
@@ -8,7 +8,7 @@
 extend schema
   @link(
     url: "https://specs.apollo.dev/federation/v2.11"
-    import: ["@key", "@shareable", "@override"]
+    import: ["@key", "@shareable", "@override", "@external", "@requires"]
   )
 
 """
@@ -24,6 +24,10 @@ type Product @key(fields: "id") {
   id: ID!
   "Number of confirmed orders for this product."
   orderCount: Int! @override(from: "products")
+  # Owned by products; declared only so revenue can @require it.
+  price: Money! @external
+  "Confirmed quantity at the current catalog price. Computed per request, never stored."
+  revenue: Money! @requires(fields: "price { amount currency }")
 }
 
 enum OrderStatus {
@@ -107,9 +111,32 @@ type Mutation {
 - Nothing is stored, so a product with no orders returns 0, the same as the placeholder, and the
   storefront sees no change at cut-over.
 
-### Rejected orders in lists, long lists
-- Not built (item 7, optional). Design: cursor pagination (`first`/`after`), rejected orders
-  excluded by default with a `status` filter to include them.
+### Revenue on a product (item 6)
+- `revenue: Money! @requires(fields: "price { amount currency }")`, with `price: Money! @external`.
+  The gateway first fetches `price` from products, then passes it to orders inside the entity
+  representation. Orders computes `sum(confirmed quantity) × price.amount`, in the price's currency.
+- The catalog price is used for that one request and dropped, never stored or copied, as the
+  README requires. A price change shows up on the next query (tested with two different prices).
+- Rejected and still-`PLACED` orders don't count, the same as `orderCount`.
+- Verified through the gateway with the README query: quantities 2 and 3 confirmed and 11 rejected
+  → `orderCount: 2`, `revenue: 12495` (5 × 2499 USD). The query plan fetches `price` from products
+  and passes it in the `_entities` call to orders.
+- Assumes one currency per product price, which is how products models it. Summing across
+  currencies would need conversion rules, a question for the products team if prices ever vary
+  by market.
+- Comparing `revenue` (list value) with the sum of `unitPricePaid` (what customers paid) is the
+  merchandising use case. A paid-total field would be cheap to add, since it only uses data
+  orders already owns.
+
+### Rejected orders in lists, long lists (item 7: not built)
+- **Skipped deliberately** to protect the core items within the time budget. It mostly repeats
+  skills shown elsewhere (pagination, filtering) without a new Kafka or federation idea.
+- Design if built:
+  `Product.orders(first: Int = 20, after: String, status: [OrderStatus!]): OrderConnection!`
+  on the `Product` stub, with cursor pagination so a product with thousands of orders never
+  returns them all at once. Rejected orders are excluded by default, since the storefront wants
+  real orders, and the `status` filter includes them on request. The cursor would encode
+  `(placedAt, id)` for a stable order, backed by an index by product rather than a scan.
 
 ### Event shape
 - Topic `orders.order-placed`, created at startup with 1 partition. Message key = `orderId`, so all
@@ -202,6 +229,10 @@ then designed to pass. The real build composed with zero errors.
 **Verified at step 1:** the gateway started cleanly, and its query plan fetches `orderCount` from
 `orders` (`Fetch(service: "orders") { ... on Product { orderCount } }`).
 
+**Adding revenue** (`@external` + `@requires`) also composed with zero errors and no new hints.
+The supergraph shows `price` resolved by products and only declared `external` in orders, and
+`revenue` owned by orders with `requires: "price { amount currency }"`.
+
 ## Asks for the products team
 - **Remove the `Product.orderCount` placeholder** (field and resolver). `orders` now serves it via
   `@override`; composition flags theirs as `OVERRIDDEN_FIELD_CAN_BE_REMOVED`.
@@ -213,7 +244,7 @@ then designed to pass. The real build composed with zero errors.
 Built-in `node:test` through `tsx`; no test framework added.
 
 ```bash
-npm test                          # from the root: 21 tests, no Kafka or other services needed
+npm test                          # from the root: 23 tests, no Kafka or other services needed
 KAFKA_TESTS=1 npm test            # adds the real-Kafka test (needs `npm run kafka:up`)
 npm run test:kafka -w orders      # only the real-Kafka test
 ```
@@ -229,10 +260,12 @@ npm run test:kafka -w orders      # only the real-Kafka test
   `placeOrder` error code; a failed publish leaves no order behind; the price paid survives a
   catalog price change; quantity 50 is accepted as `PLACED`; `order(id)` returns null for unknown
   ids; `Order.product` is a federation reference; `orderCount` through `_entities` counts only
-  confirmed orders.
+  confirmed orders; `revenue` uses the price passed in by the gateway, so a new price gives a new
+  revenue.
 - **Composition** (`composition.test.ts`): composes orders with the products team's real schema
-  file (read-only) and asserts zero errors and that the supergraph routes `orderCount` to orders
-  with `override: "products"`. It fails if either schema drifts.
+  file (read-only) and asserts zero errors, that the supergraph routes `orderCount` to orders
+  with `override: "products"`, and that `revenue` requires products' `price`. It fails if either
+  schema drifts.
 - **Real Kafka** (`kafka.integration.test.ts`, opt-in): publishes an event, then the same bytes
   again; asserts `confirmed` then `duplicate`, with a count of 1. Uses its own consumer group so it
   doesn't move the real consumer's offsets.

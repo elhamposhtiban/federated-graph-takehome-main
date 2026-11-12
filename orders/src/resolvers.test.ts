@@ -142,3 +142,25 @@ test("Product.orderCount counts only confirmed orders", async () => {
     { id: "3", orderCount: 0 },
   ]);
 });
+
+test("Product.revenue is confirmed quantity at the price the gateway passes in", async () => {
+  const base = { productId: "1", unitPricePaid: { amount: 1, currency: "USD" }, placedAt: "" };
+  saveOrder({ ...base, id: "a", quantity: 2, status: "CONFIRMED" });
+  saveOrder({ ...base, id: "b", quantity: 3, status: "CONFIRMED" });
+  saveOrder({ ...base, id: "c", quantity: 50, status: "REJECTED" });
+  saveOrder({ ...base, id: "d", quantity: 7, status: "PLACED" });
+
+  // With @requires, the gateway includes products' current price in the representation.
+  const revenueAt = async (amount: number) => {
+    const { data } = await run(`{
+      _entities(representations: [
+        { __typename: "Product", id: "1", price: { amount: ${amount}, currency: "USD" } }
+      ]) { ... on Product { revenue { amount currency } } }
+    }`);
+    return data!._entities[0].revenue;
+  };
+
+  assert.deepEqual(await revenueAt(2499), { amount: 5 * 2499, currency: "USD" });
+  // A catalog price change shows up on the next request: nothing was stored.
+  assert.deepEqual(await revenueAt(3000), { amount: 5 * 3000, currency: "USD" });
+});
