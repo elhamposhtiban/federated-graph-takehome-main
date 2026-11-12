@@ -1,0 +1,27 @@
+{
+  "name": "federated-graph-takehome",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "products",
+    "orders",
+    "gateway"
+  ],
+  "scripts": {
+    "kafka:up": "docker compose up -d",
+    "kafka:down": "docker compose down",
+    "kafka:logs": "docker compose logs -f kafka",
+    "dev": "concurrently -n products,gateway -c blue,green \"npm run dev -w products\" \"npm run dev -w gateway\"",
+    "dev:orders": "npm run dev -w orders",
+    "test": "npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "concurrently": "^10.0.5",
+    "typescript": "^5.9.3",
+    "tsx": "^4.23.13"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
