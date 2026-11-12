@@ -88,9 +88,11 @@ type Mutation {
 - Not built (item 7, optional). Design: cursor pagination (`first`/`after`), rejected orders
   excluded by default with a `status` filter to include them.
 
-### Event shape _(planned, step 3)_
+### Event shape
 - Topic `orders.order-placed`, created at startup with 1 partition. Message key = `orderId`, so all
   events for one order land on the same partition, in order.
+- Consumer group `orders-fulfillment` runs in the orders process, because the store it settles is
+  in that process's memory. In production it would be its own service writing to a shared database.
 - ```json
   {
     "eventId": "uuid",
@@ -178,6 +180,16 @@ Kafka, a composition test, and an opt-in real-Kafka duplicate test (`KAFKA_TESTS
 5. Push the async outcome to clients (subscription or notification) instead of polling `order(id)`.
 6. Indexed counts instead of scanning every order for `orderCount`.
 7. Progressive `@override` (`label: "percent(x)"`) to roll out a field takeover safely.
+8. Replace kafkajs. 2.2.4 is no longer maintained and prints `TimeoutNegativeWarning` on Node 26
+   (harmless). Confluent's `@confluentinc/kafka-javascript` keeps a kafkajs-compatible API.
+
+## Gotchas found while building
+- **Apollo Server's signal handling vs. Kafka.** By default Apollo stops itself on SIGINT/SIGTERM
+  and then re-sends the signal, killing the process before the consumer leaves its group. Kafka then
+  keeps a dead member for ~30s (the session timeout) before rebalancing, so after a `tsx watch`
+  restart the new consumer waits. Fixed with `stopOnTerminationSignals: false` and our own
+  shutdown that disconnects the consumer and producer and stops the server. Verified with
+  `kafka-consumer-groups.sh --describe --members`: no members right after SIGTERM.
 
 ## Time spent
 _TODO (me)_
