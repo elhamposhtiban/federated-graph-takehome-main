@@ -209,9 +209,44 @@ then designed to pass. The real build composed with zero errors.
   system, fulfillment would reserve stock from whichever service owns inventory. We didn't touch
   products because of the ground rules.
 
-## Tests _(planned, step 7)_
-TBD once written. Planned: pure settlement and consumer logic, resolvers with fake products and
-Kafka, a composition test, and an opt-in real-Kafka duplicate test (`KAFKA_TESTS=1`).
+## Tests
+Built-in `node:test` through `tsx`; no test framework added.
+
+```bash
+npm test                          # from the root: 21 tests, no Kafka or other services needed
+KAFKA_TESTS=1 npm test            # adds the real-Kafka test (needs `npm run kafka:up`)
+npm run test:kafka -w orders      # only the real-Kafka test
+```
+
+**What they cover**
+- **Settlement rule and state machine** (`domain.test.ts`): 10 confirms and 11 rejects (the
+  boundary); only `PLACED` moves; settled orders never change.
+- **Consumer logic** (`fulfillment.test.ts`), fed raw strings as Kafka delivers them: confirmed,
+  rejected (and not counted), **the same message twice settles and counts once**, unknown order
+  skipped, and 12 malformed shapes (non-JSON, wrong version or type, missing or invalid fields)
+  skipped without throwing. Also checks that the producer's event round-trips through the parser.
+- **Resolvers** (`resolvers.test.ts`), run in-process with fake products and Kafka: every
+  `placeOrder` error code; a failed publish leaves no order behind; the price paid survives a
+  catalog price change; quantity 50 is accepted as `PLACED`; `order(id)` returns null for unknown
+  ids; `Order.product` is a federation reference; `orderCount` through `_entities` counts only
+  confirmed orders.
+- **Composition** (`composition.test.ts`): composes orders with the products team's real schema
+  file (read-only) and asserts zero errors and that the supergraph routes `orderCount` to orders
+  with `override: "products"`. It fails if either schema drifts.
+- **Real Kafka** (`kafka.integration.test.ts`, opt-in): publishes an event, then the same bytes
+  again; asserts `confirmed` then `duplicate`, with a count of 1. Uses its own consumer group so it
+  doesn't move the real consumer's offsets.
+
+**Checked that they catch bugs.** Removing the `PLACED` guard, changing `> 10` to `>= 10`, and
+dropping the price copy or the undo-on-publish-failure each made exactly the relevant tests fail.
+
+**What they don't cover**
+- The full three-process flow (gateway + products + orders). It was verified by hand through the
+  gateway while building, but there's no automated end-to-end test.
+- `products-client.ts` against a real products server (faked in the tests); timeouts.
+- Restarts, data loss and consumer-group rebalancing; ordering across multiple partitions.
+- Load or performance, such as `orderCount` scanning every order.
+- Each Kafka test run leaves a small `orders-test-<uuid>` consumer group behind.
 
 ## Follow-ups (rough priority)
 1. Durable storage. Today a restart loses every order, and Kafka events for them become

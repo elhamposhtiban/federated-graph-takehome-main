@@ -2,7 +2,7 @@ import { Kafka, Partitioners, logLevel } from "kafkajs";
 
 import type { Order } from "./domain.js";
 import { ORDER_PLACED_TOPIC, toOrderPlacedEvent } from "./events.js";
-import { handleOrderPlaced } from "./fulfillment.js";
+import { handleOrderPlaced, type HandleResult } from "./fulfillment.js";
 
 const kafka = new Kafka({
   clientId: "orders",
@@ -36,7 +36,17 @@ export async function publishOrderPlaced(order: Order) {
   });
 }
 
-export async function startFulfillmentConsumer(groupId = "orders-fulfillment") {
+function logResult({ outcome, orderId, eventId }: HandleResult, where: string) {
+  const line = `[fulfillment] ${outcome} order=${orderId ?? "-"} event=${eventId ?? "-"} ${where}`;
+  if (outcome === "confirmed" || outcome === "rejected") console.log(line);
+  else console.warn(line);
+}
+
+// onResult lets the Kafka integration test observe outcomes instead of parsing logs.
+export async function startFulfillmentConsumer({
+  groupId = "orders-fulfillment",
+  onResult = logResult,
+}: { groupId?: string; onResult?: (result: HandleResult, where: string) => void } = {}) {
   const consumer = kafka.consumer({ groupId });
   await consumer.connect();
   // fromBeginning only applies before the group has committed an offset.
@@ -45,10 +55,7 @@ export async function startFulfillmentConsumer(groupId = "orders-fulfillment") {
     eachMessage: async ({ partition, message }) => {
       const where = `partition=${partition} offset=${message.offset} key=${message.key?.toString()}`;
       try {
-        const { outcome, orderId, eventId } = handleOrderPlaced(message.value?.toString());
-        const line = `[fulfillment] ${outcome} order=${orderId ?? "-"} event=${eventId ?? "-"} ${where}`;
-        if (outcome === "confirmed" || outcome === "rejected") console.log(line);
-        else console.warn(line);
+        onResult(handleOrderPlaced(message.value?.toString()), where);
       } catch (err) {
         // A bug must not wedge the partition; log it and move on (DLQ is a follow-up).
         console.error(`[fulfillment] error ${where}`, err);
