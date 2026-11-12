@@ -59,6 +59,10 @@ export function createResolvers({ fetchProductPrice, publishOrderPlaced }: Resol
         return order;
       },
     },
+    Order: {
+      // A reference only; the gateway fetches name/category from products via federation.
+      product: (order: Order) => ({ __typename: "Product", id: order.productId }),
+    },
     Product: {
       // Derived from order state, so duplicate events can never inflate it.
       orderCount: (product: { id: string }) => confirmedOrdersFor(product.id).length,

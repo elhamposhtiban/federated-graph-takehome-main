@@ -78,6 +78,16 @@ type Mutation {
 - The client never sends a price. The returned price is copied onto the order as
   `unitPricePaid` and never refreshed, like a receipt.
 
+### Showing the product on an order
+- `orders` stores only `productId`. `Order.product` returns a reference
+  (`{ __typename: "Product", id }`), and the gateway fetches `name` and `category` from products
+  through `_entities`. Orders makes no HTTP call to answer a query.
+- `product` is **nullable**. Verified: with products stopped, `order { status unitPricePaid product }`
+  still returns the status and price paid, with `product: null` and an error naming products.
+  As `Product!`, the null would have spread up and erased the whole order.
+- Querying `unitPricePaid` alongside `product { price }` shows what the customer paid next to
+  today's catalog price.
+
 ### Order status
 - `PLACED → CONFIRMED` or `PLACED → REJECTED`. Both settled states are final.
 - Only `PLACED` can move, which is what makes duplicate events harmless.
