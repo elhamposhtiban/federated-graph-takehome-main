@@ -70,7 +70,7 @@ type Mutation {
   `placeOrder { id status }` shape, infrastructure failures would still need top-level errors,
   and it costs time better spent on items 1-4.
 
-### How we learn the price paid, and where it lives _(planned, step 2)_
+### How we learn the price paid, and where it lives
 - `orders` doesn't own products, so `placeOrder` asks the products subgraph directly
   (`PRODUCTS_URL`, default `http://localhost:4001/graphql`) for `product(id) { id price }`.
   This is the only HTTP call to products, and it's in a mutation, as the rules allow.
