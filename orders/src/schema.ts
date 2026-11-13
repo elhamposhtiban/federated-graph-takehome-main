@@ -4,7 +4,7 @@ export const typeDefs = gql`
   extend schema
     @link(
       url: "https://specs.apollo.dev/federation/v2.11"
-      import: ["@key", "@shareable", "@override"]
+      import: ["@key", "@shareable", "@override", "@external", "@requires"]
     )
 
   # Copied verbatim from products: shared value types must match exactly to compose.
@@ -21,6 +21,10 @@ export const typeDefs = gql`
     id: ID!
     "Number of confirmed orders for this product."
     orderCount: Int! @override(from: "products")
+    # Owned by products; declared only so revenue can @require it.
+    price: Money! @external
+    "Confirmed quantity at the current catalog price. Computed per request, never stored."
+    revenue: Money! @requires(fields: "price { amount currency }")
   }
 
   enum OrderStatus {
