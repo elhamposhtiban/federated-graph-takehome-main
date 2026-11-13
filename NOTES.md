@@ -1,8 +1,21 @@
 # NOTES
 
-> Draft, updated as each build step lands.
+## Running it
 
-## Schema (`orders`)
+```bash
+npm install
+npm run kafka:up      # Kafka on :9092, Kafka UI on :8080
+npm run dev:orders    # start orders first (:4002)
+npm run dev           # products (:4001) + gateway (:4000)
+npm test              # no services needed; KAFKA_TESTS=1 npm test also runs the Kafka test
+```
+
+Start orders before the gateway. The gateway composes once at startup, so restart it after any
+schema change.
+
+I built items 1–6, 8 and 9. I designed item 7 but didn't build it (reason below).
+
+## Schema
 
 ```graphql
 extend schema
@@ -60,249 +73,211 @@ type Mutation {
 ## Decisions
 
 ### What `placeOrder` returns, and unknown products
-- Returns `Order!` in status `PLACED`. The outcome arrives later; clients re-query `order(id)`.
-- Failures are GraphQL errors with `extensions.code`:
-  - `BAD_USER_INPUT`: quantity is not a whole number ≥ 1.
-  - `PRODUCT_NOT_FOUND`: products returned `null` for the id.
-  - `PRODUCTS_UNAVAILABLE`: products could not be reached. Kept separate so an outage is never
-    reported to a customer as "this product doesn't exist".
-  - `ORDER_NOT_PLACED`: the Kafka publish failed; the saved order is removed (see dual write below).
-- Quantity > 10 is **accepted** as `PLACED`. Rejecting it is fulfillment's job; if the mutation did
-  it, the mutation would be settling the order.
-- Alternative considered: a result union (`OrderPlaced | ProductNotFound | ...`), which makes
-  business errors visible in the schema. Not chosen: it doesn't match the README's
-  `placeOrder { id status }` shape, infrastructure failures would still need top-level errors,
-  and it costs time better spent on items 1-4.
 
-### How we learn the price paid, and where it lives
-- `orders` doesn't own products, so `placeOrder` asks the products subgraph directly
-  (`PRODUCTS_URL`, default `http://localhost:4001/graphql`) for `product(id) { id price }`.
-  This is the only HTTP call to products, and it's in a mutation, as the rules allow.
-  Direct rather than via the gateway, to avoid a gateway → orders → gateway loop.
-- The client never sends a price. The returned price is copied onto the order as
-  `unitPricePaid` and never refreshed, like a receipt.
+`placeOrder` returns the order in `PLACED`. The result (confirmed or rejected) comes later, so the client asks `order(id)` again.
 
-### Showing the product on an order
-- `orders` stores only `productId`. `Order.product` returns a reference
-  (`{ __typename: "Product", id }`), and the gateway fetches `name` and `category` from products
-  through `_entities`. Orders makes no HTTP call to answer a query.
-- `product` is **nullable**. Verified: with products stopped, `order { status unitPricePaid product }`
-  still returns the status and price paid, with `product: null` and an error naming products.
-  As `Product!`, the null would have spread up and erased the whole order.
-- Querying `unitPricePaid` alongside `product { price }` shows what the customer paid next to
-  today's catalog price.
+Errors are normal GraphQL errors with a code:
+
+- `BAD_USER_INPUT`: quantity below 1. GraphQL's `Int` already rejects values like 2.5.
+- `PRODUCT_NOT_FOUND`: products says the id doesn't exist.
+- `PRODUCTS_UNAVAILABLE`: products didn't answer. I kept this separate from "not found" so an
+  outage never tells a customer that a real product doesn't exist.
+- `ORDER_NOT_PLACED`: publishing to Kafka failed. The order is removed and the client can retry.
+
+An order for more than 10 is accepted as `PLACED`. Rejecting it is fulfillment's decision, not
+the mutation's.
+
+I considered a result union (`OrderPlaced | ProductNotFound | ...`) so errors show up in the
+schema. I didn't use it: it doesn't fit the README's `placeOrder { id status }` example, and
+outages would still need top-level errors. I'd revisit it if clients wanted typed errors.
+
+### How I learn the price paid, and where it's stored
+
+Orders doesn't own prices and can't trust a price from the client, so `placeOrder` asks the
+products subgraph for `product(id) { price }`. That is the only HTTP call orders makes to
+products, and it only happens in the mutation. I call products directly (`PRODUCTS_URL`) rather than through the gateway, to avoid a gateway → orders → gateway loop.
+
+The price is copied onto the order as `unitPricePaid` and never updated, like a receipt.
 
 ### Order status
-- `PLACED → CONFIRMED` or `PLACED → REJECTED`. Both settled states are final.
-- Only `PLACED` can move, which is what makes duplicate events harmless.
-- Settlement rule (README item 2): quantity > 10 → `REJECTED`, otherwise `CONFIRMED`. It stands in
-  for a real stock check.
 
-### Taking over `Product.orderCount`
-- `orders` declares `orderCount: Int! @override(from: "products")` on its `Product` stub. The gateway
-  stops routing the field to products; their placeholder field and `() => 0` resolver stay as
-  they are, untouched.
-- It's the number of `CONFIRMED` orders, computed from order state on each request rather than
-  stored. `PLACED` and `REJECTED` don't count, and a duplicate event can't inflate it.
-- Verified through the gateway: product 5 with quantities 1, 4 and 20 → `orderCount: 2`, while the
-  products subgraph queried directly still returns its placeholder 0. The query plan for
-  `products { name orderCount }` fetches the list from products, then makes one batched `_entities`
-  call to orders for all five products, not one call per product.
-- Nothing is stored, so a product with no orders returns 0, the same as the placeholder, and the
-  storefront sees no change at cut-over.
+`PLACED` → `CONFIRMED` or `REJECTED`. Only `PLACED` can change; the other two are final. That one rule is what makes duplicate events harmless.
 
-### Revenue on a product (item 6)
-- `revenue: Money! @requires(fields: "price { amount currency }")`, with `price: Money! @external`.
-  The gateway first fetches `price` from products, then passes it to orders inside the entity
-  representation. Orders computes `sum(confirmed quantity) × price.amount`, in the price's currency.
-- The catalog price is used for that one request and dropped, never stored or copied, as the
-  README requires. A price change shows up on the next query (tested with two different prices).
-- Rejected and still-`PLACED` orders don't count, the same as `orderCount`.
-- Verified through the gateway with the README query: quantities 2 and 3 confirmed and 11 rejected
-  → `orderCount: 2`, `revenue: 12495` (5 × 2499 USD). The query plan fetches `price` from products
-  and passes it in the `_entities` call to orders.
-- Assumes one currency per product price, which is how products models it. Summing across
-  currencies would need conversion rules, a question for the products team if prices ever vary
-  by market.
-- Comparing `revenue` (list value) with the sum of `unitPricePaid` (what customers paid) is the
-  merchandising use case. A paid-total field would be cheap to add, since it only uses data
-  orders already owns.
+Fulfillment rejects quantities over 10 and confirms the rest. In a real system this would be a
+stock check.
 
-### Rejected orders in lists, long lists (item 7: not built)
-- **Skipped deliberately** to protect the core items within the time budget. It mostly repeats
-  skills shown elsewhere (pagination, filtering) without a new Kafka or federation idea.
-- Design if built:
-  `Product.orders(first: Int = 20, after: String, status: [OrderStatus!]): OrderConnection!`
-  on the `Product` stub, with cursor pagination so a product with thousands of orders never
-  returns them all at once. Rejected orders are excluded by default, since the storefront wants
-  real orders, and the `status` filter includes them on request. The cursor would encode
-  `(placedAt, id)` for a stable order, backed by an index by product rather than a scan.
+### Rejected orders in lists, and long lists (item 7, not built)
+
+I skipped this to keep time for items 1–4. It's mostly pagination and filtering, with nothing new on the Kafka or federation side.
+
+How I'd build it: `Product.orders(first: Int = 20, after: String, status: [OrderStatus!])`
+returning a connection. Rejected orders hidden by default, with `status` to include them. The
+cursor would be `(placedAt, id)` so pages stay stable, backed by an index per product instead of scanning every order.
 
 ### Event shape
-- Topic `orders.order-placed`, created at startup with 1 partition. Message key = `orderId`, so all
-  events for one order land on the same partition, in order.
-- Consumer group `orders-fulfillment` runs in the orders process, because the store it settles is
-  in that process's memory. In production it would be its own service writing to a shared database.
-- ```json
-  {
-    "eventId": "uuid",
-    "eventType": "OrderPlaced",
-    "version": 1,
-    "occurredAt": "ISO-8601",
-    "data": { "orderId": "uuid", "productId": "1", "quantity": 2,
-              "unitPricePaid": { "amount": 2499, "currency": "USD" } }
+
+One topic, `orders.order-placed`, with one partition. The message key is the order id, so all
+events for an order land on the same partition and stay in order.
+
+```json
+{
+  "eventId": "uuid",
+  "eventType": "OrderPlaced",
+  "version": 1,
+  "occurredAt": "2026-11-12T10:00:00.000Z",
+  "data": {
+    "orderId": "uuid",
+    "productId": "1",
+    "quantity": 2,
+    "unitPricePaid": { "amount": 2499, "currency": "USD" }
   }
-  ```
-- `eventId` is for tracing duplicates in logs; `version` lets consumers tell shapes apart if the
-  event changes.
+}
+```
+
+`eventId` makes duplicates easy to spot in logs. `version` lets a consumer tell old and new shapes apart if the event changes. The price paid is included so other consumers, like billing, don't have to call back for it.
+
+The consumer (group `orders-fulfillment`) runs inside the orders process, because the orders it settles live in that process's memory. In production it would be its own service on a shared database.
 
 ### Duplicate delivery
-- Kafka is at-least-once. A crash between processing and committing the offset redelivers the event.
-- The consumer (group `orders-fulfillment`) settles only orders still `PLACED`; a redelivered event
-  finds the order already settled and does nothing.
-- `orderCount` is computed from order state, not a stored counter, so it can't be incremented twice.
-- Order ids are UUIDs, so after a restart an old event can't match a new order that reused an id.
-- Bad events (malformed, unknown version, unknown order such as one lost in a restart) are logged
-  with `eventId`/`orderId` and skipped. The handler never throws, so one bad message can't block
-  the partition.
-- Every message ends in one of five outcomes: `confirmed`, `rejected` (logged as info) or
-  `duplicate`, `unknown-order`, `malformed` (logged as warnings). An unexpected exception is
-  logged as an error and skipped, not rethrown.
-- Skipping trades a stuck partition for a possibly lost event; a dead-letter topic would keep
-  those events for replay (follow-up 3).
-- Verified by hand: re-producing a confirmed order's exact message logged `duplicate`, and
-  `orderCount` stayed at 1. Non-JSON, `version: 99`, a missing `quantity` and an unknown order id
-  were each skipped, and the next real order still settled.
 
-Replaying a duplicate by hand (Kafka running):
+Kafka delivers at least once. If the consumer crashes after handling a message but before
+committing its offset, it gets that message again.
+
+- Fulfillment only settles orders that are still `PLACED`. A redelivered event finds the order
+  already settled and does nothing.
+- `orderCount` is counted from order state, not kept as a running counter, so nothing can be
+  added twice.
+- Order ids are UUIDs, so an old event can't match a new order after a restart.
+- Messages I can't use (bad JSON, unknown version, missing fields, an order I don't have) are
+  logged and skipped. The handler never throws, because a throw makes kafkajs retry the same
+  message forever and block everything behind it.
+
+The trade-off: a skipped message is gone apart from its log line. A dead-letter topic would fix that (follow-up 3).
+
+To replay a duplicate by hand, read a message back out and send it again unchanged:
+
 ```bash
-# read the message at offset N back out, with its key
 docker exec takehome-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
   --topic orders.order-placed --partition 0 --offset N --max-messages 1 \
   --property print.key=true --property key.separator='|' > dup.txt
-# produce it again, byte for byte
 docker exec -i takehome-kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
   --topic orders.order-placed --property parse.key=true --property key.separator='|' < dup.txt
 ```
 
-### Dual write
-- Save the order, then publish. Never the reverse, or a fast consumer could see an event for an
-  order that doesn't exist yet.
-- If the publish fails, the order is deleted and the client gets `ORDER_NOT_PLACED` ("try again").
+The orders log shows `duplicate`, and `orderCount` doesn't change.
+
+### Other decisions
+
+**Save, then publish.** If I published first, a fast consumer could see an event for an order
+that isn't saved yet. If the publish fails, I delete the order and return `ORDER_NOT_PLACED`.
+One edge case: if Kafka stores the event but its acknowledgement times out, I delete an order
+that was actually published. The consumer then skips that event as an unknown order and the
+client's retry creates a fresh one, so nothing breaks, but it's the reason a transactional outbox
+is the real fix (follow-up 2).
+
+**`Order.product` is nullable.** Orders stores only `productId` and returns a reference; the
+gateway gets `name` and `category` from products. If products is down, the client still gets the order's status and price paid, with `product: null`. With `Product!`, the whole order would come back null.
+
+**Taking over `orderCount`.** Orders declares `orderCount: Int! @override(from: "products")`. The gateway now asks orders for it. Products' placeholder is still there; it just isn't called. Only confirmed orders count, and a product with no orders still returns 0, so the storefront sees no change at the switch.
+
+**Revenue (item 6).** Orders declares `price` as `@external` and `revenue` with
+`@requires(fields: "price { amount currency }")`. The gateway fetches the current price from
+products and passes it in with each request; orders multiplies it by the confirmed quantity and keeps nothing. If the catalog price changes, the next query reflects it. This assumes one currency per product, which is how products models prices today.
 
 ## Composition errors
-Before writing `orders`, I composed candidate schemas against `products` offline
-(`composeServices` from `@apollo/composition` 2.14.4, the gateway's version) to learn the rules,
-then designed to pass. The real build composed with zero errors.
 
-1. **`Product.orderCount` declared without `@override`**
-   ```
-   INVALID_FIELD_SHARING: Non-shareable field "Product.orderCount" is resolved from multiple
-   subgraphs: it is resolved from subgraphs "orders" and "products" and defined as non-shareable in all of them
-   ```
-   - Cause: in Fed 2, only one subgraph may resolve a field unless it's `@shareable`.
-   - Fix: `orderCount: Int! @override(from: "products")`. `@shareable` would be wrong: it needs a
-     change in products, and both answers (0 and the real count) would count as valid.
+Before writing orders, I composed draft schemas against products offline with
+`@apollo/composition` (the gateway's version). I hit these three errors there, so the real build composed cleanly. Adding `@requires` for revenue later also composed on the first try.
 
-2. **`Money` declared without `@shareable`**
-   ```
-   INVALID_FIELD_SHARING: Non-shareable field "Money.amount" is resolved from multiple subgraphs:
-   it is resolved from subgraphs "orders" and "products" and defined as non-shareable in subgraph "orders"
-   ```
-   (and the same for `Money.currency`)
-   - Cause: every subgraph that declares a shared value type must mark it `@shareable`.
-   - Fix: `type Money @shareable` in orders.
+1. **`orderCount` without `@override`**
+   `INVALID_FIELD_SHARING: Non-shareable field "Product.orderCount" is resolved from multiple subgraphs`.
+   Only one subgraph may resolve a field. Fixed with `@override(from: "products")`. `@shareable` would have needed a change in products and let the gateway pick either answer (0 or the real count).
+
+2. **`Money` without `@shareable`**
+   `INVALID_FIELD_SHARING: Non-shareable field "Money.amount" is resolved from multiple subgraphs`
+   (same for `currency`). Every subgraph that declares a shared value type has to mark it. Fixed with `type Money @shareable`.
 
 3. **`Money` with a different field type**
-   ```
-   FIELD_TYPE_MISMATCH: Type of field "Money.amount" is incompatible across subgraphs: it has type
-   "Float!" in subgraph "orders" but type "Int!" in subgraph "products"
-   ```
-   - Cause: shared value types must match field by field.
-   - Fix: copy products' `Money` exactly, including its description, so composition doesn't raise
-     an inconsistent-description hint.
+   `FIELD_TYPE_MISMATCH: Type of field "Money.amount" is incompatible across subgraphs: it has type "Float!" in subgraph "orders" but type "Int!" in subgraph "products"`. Fixed by copying products' `Money` exactly. I copied the description too: a different one still composes, but the supergraph can end up showing orders' wording on products' type.
 
-**Hint (not an error):** `OVERRIDDEN_FIELD_CAN_BE_REMOVED: Field "Product.orderCount" on subgraph
-"products" is overridden.` This is the products team's to act on; see the asks below.
-`IntrospectAndCompose` doesn't print hints; this one came from composing the same SDL offline.
-
-**Verified at step 1:** the gateway started cleanly, and its query plan fetches `orderCount` from
-`orders` (`Fetch(service: "orders") { ... on Product { orderCount } }`).
-
-**Adding revenue** (`@external` + `@requires`) also composed with zero errors and no new hints.
-The supergraph shows `price` resolved by products and only declared `external` in orders, and
-`revenue` owned by orders with `requires: "price { amount currency }"`.
+Composition also gives a hint, `OVERRIDDEN_FIELD_CAN_BE_REMOVED`, for products' old `orderCount`. That one is theirs to act on.
 
 ## Asks for the products team
-- **Remove the `Product.orderCount` placeholder** (field and resolver). `orders` now serves it via
-  `@override`; composition flags theirs as `OVERRIDDEN_FIELD_CAN_BE_REMOVED`.
-- **Inventory/stock.** Products has no stock data, so placing an order decrements nothing. In a real
-  system, fulfillment would reserve stock from whichever service owns inventory. We didn't touch
-  products because of the ground rules.
+
+- Remove the `orderCount` placeholder field and resolver. Orders serves it now.
+- Stock. Products has no inventory, so placing an order reserves nothing. Fulfillment should
+  check and reserve stock with whoever owns it, instead of using the "over 10" rule.
 
 ## Tests
-Built-in `node:test` through `tsx`; no test framework added.
 
-```bash
-npm test                          # from the root: 23 tests, no Kafka or other services needed
-KAFKA_TESTS=1 npm test            # adds the real-Kafka test (needs `npm run kafka:up`)
-npm run test:kafka -w orders      # only the real-Kafka test
-```
+`npm test` runs 23 tests with `node:test`, with no services needed. `KAFKA_TESTS=1 npm test` adds
+one test against real Kafka.
 
-**What they cover**
-- **Settlement rule and state machine** (`domain.test.ts`): 10 confirms and 11 rejects (the
-  boundary); only `PLACED` moves; settled orders never change.
-- **Consumer logic** (`fulfillment.test.ts`), fed raw strings as Kafka delivers them: confirmed,
-  rejected (and not counted), **the same message twice settles and counts once**, unknown order
-  skipped, and 12 malformed shapes (non-JSON, wrong version or type, missing or invalid fields)
-  skipped without throwing. Also checks that the producer's event round-trips through the parser.
-- **Resolvers** (`resolvers.test.ts`), run in-process with fake products and Kafka: every
-  `placeOrder` error code; a failed publish leaves no order behind; the price paid survives a
-  catalog price change; quantity 50 is accepted as `PLACED`; `order(id)` returns null for unknown
-  ids; `Order.product` is a federation reference; `orderCount` through `_entities` counts only
-  confirmed orders; `revenue` uses the price passed in by the gateway, so a new price gives a new
-  revenue.
-- **Composition** (`composition.test.ts`): composes orders with the products team's real schema
-  file (read-only) and asserts zero errors, that the supergraph routes `orderCount` to orders
-  with `override: "products"`, and that `revenue` requires products' `price`. It fails if either
-  schema drifts.
-- **Real Kafka** (`kafka.integration.test.ts`, opt-in): publishes an event, then the same bytes
-  again; asserts `confirmed` then `duplicate`, with a count of 1. Uses its own consumer group so it
-  doesn't move the real consumer's offsets.
+What they cover:
 
-**Checked that they catch bugs.** Removing the `PLACED` guard, changing `> 10` to `>= 10`, and
-dropping the price copy or the undo-on-publish-failure each made exactly the relevant tests fail.
+- The settlement rule (10 confirms, 11 rejects), and that settled orders never change.
+- The consumer, fed raw messages: the same message twice settles and counts once; unknown orders and a dozen kinds of bad message are skipped without throwing.
+- `placeOrder` with fake products and Kafka: every error code, no order left behind when
+  publishing fails, and the price paid not moving when the catalog price changes.
+- `order(id)`, `Order.product`, `orderCount` and `revenue`, through the same `_entities` call the gateway makes.
+- Composition against products' real schema file: no errors, `orderCount` routed to orders,
+  `revenue` requiring `price`.
+- Real Kafka (opt-in): the same message sent twice is settled and counted once.
 
-**What they don't cover**
-- The full three-process flow (gateway + products + orders). It was verified by hand through the
-  gateway while building, but there's no automated end-to-end test.
-- `products-client.ts` against a real products server (faked in the tests); timeouts.
-- Restarts, data loss and consumer-group rebalancing; ordering across multiple partitions.
-- Load or performance, such as `orderCount` scanning every order.
-- Each Kafka test run leaves a small `orders-test-<uuid>` consumer group behind.
+To check the tests catch real bugs, I broke the code on purpose (removed the `PLACED` check,
+changed `> 10` to `>= 10`, dropped the price copy). The right tests failed each time.
+
+Not covered: the full flow across all three services (I checked that by hand), restarts and
+consumer rebalancing, and performance.
 
 ## Follow-ups (rough priority)
-1. Durable storage. Today a restart loses every order, and Kafka events for them become
-   "unknown order".
-2. Transactional outbox instead of save-then-publish-then-undo.
-3. Dead-letter topic for events the consumer skips.
-4. Inventory reservation in fulfillment, replacing the "> 10" rule.
-5. Push the async outcome to clients (subscription or notification) instead of polling `order(id)`.
-6. Indexed counts instead of scanning every order for `orderCount`.
-7. Progressive `@override` (`label: "percent(x)"`) to roll out a field takeover safely.
-8. Replace kafkajs. 2.2.4 is no longer maintained and prints `TimeoutNegativeWarning` on Node 26
-   (harmless). Confluent's `@confluentinc/kafka-javascript` keeps a kafkajs-compatible API.
 
-## Gotchas found while building
-- **Apollo Server's signal handling vs. Kafka.** By default Apollo stops itself on SIGINT/SIGTERM
-  and then re-sends the signal, killing the process before the consumer leaves its group. Kafka then
-  keeps a dead member for ~30s (the session timeout) before rebalancing, so after a `tsx watch`
-  restart the new consumer waits. Fixed with `stopOnTerminationSignals: false` and our own
-  shutdown that disconnects the consumer and producer and stops the server. Verified with
-  `kafka-consumer-groups.sh --describe --members`: no members right after SIGTERM.
+1. A real database. A restart currently loses every order.
+2. Transactional outbox instead of save, publish, undo.
+3. Dead-letter topic for skipped messages.
+4. Real stock reservation instead of the "over 10" rule.
+5. Tell the client when an order settles (subscription or notification) instead of polling.
+6. Count orders with an indexed query instead of scanning all of them.
+7. An automated end-to-end test across all three services.
+8. Item 7 (`Product.orders`), as designed above.
+9. Progressive `@override` to roll out the next field takeover gradually.
+10. Move off kafkajs. It's unmaintained and warns on Node 26 (`TimeoutNegativeWarning`, harmless).
+
+## Something I ran into
+
+Apollo Server handles Ctrl+C itself and kills the process before the Kafka consumer can leave its group. Kafka then keeps a dead consumer for about 30 seconds, and a restarted orders waits for it.
+I turned Apollo's handling off (`stopOnTerminationSignals: false`) and shut down Kafka and the
+server myself.
 
 ## Time spent
-_TODO (me)_
+
+About 6 hours over two sessions, which is why item 7 is a design rather than code. Most of the
+time went into items 1–4, as the README asks.
 
 ## How I used AI
-_TODO (me)_
+
+I used Claude Code with Opus 5.5 as a pairing partner. Claude wrote most of the code. My part was
+the design decisions, the questions, and reviewing every step before it was committed.
+
+**Kickoff.** I started in plan mode with a prompt structured as ROCC: role, objective, context and constraints. The constraints were the README's hard rules plus how I wanted to work, for example:
+
+> Never edit anything in `products/`. If a change seems needed, stop and tell me.
+> Processing a duplicate event must not settle twice, count twice, or crash the consumer.
+> Never start the next phase or step without my "next".
+
+**Plan before code.** It explored the repo read-only first, then we went through the design one part at a time before any code was written. The overall design was mine to sign off; the AI filled in gaps and helped me see the whole picture.
+
+**Finding holes.** I kept going back and forth with it, and some of its plan didn't hold up. Two examples: it didn't account for stock at all (products has none, so I made it an ask for the products team), and it had no answer for telling a client to retry when an order fails, which led to undoing the order and returning `ORDER_NOT_PLACED` when Kafka is down.
+
+**Decisions I made** where there was a real trade-off: returning `Order` with error codes instead of a union, a nullable `product`, keeping the README's status names instead of adding `PENDING`, undoing the order when Kafka fails, logging bad events with a dead-letter topic as a follow-up, and building revenue but not item 7.
+
+**Small steps.** I broke the build into nine steps. After each one I read the diff in Cursor,
+ran the commands and queries it gave me, and only then committed.
+
+**Making it prove things.** I don't trust an agent's answer just because it sounds right, so I
+asked it to prove claims in different ways: running the system, showing the gateway's query
+plan, checking Kafka's consumer groups, and breaking the code on purpose to confirm the tests
+fail. That process caught real mistakes: it once stated a composition behaviour it hadn't tested,
+and its first shutdown code left a dead Kafka consumer behind (see "Something I ran into").
+
+**With more time,** I'd turn this setup into a Claude Code skill for the project: the hard rules, the step-by-step loop and the verification commands. The next session, or a teammate, would then start from the same guardrails instead of a long kickoff prompt.
